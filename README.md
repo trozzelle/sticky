@@ -30,10 +30,11 @@ In RPC mode the pin is still injected; only the widget is skipped.
 ## Install
 
 ```sh
-omp plugin install github:trozzelle/sticky
+omp plugin install github:trozzelle/sticky#v0.1.0   # a release (recommended)
+omp plugin install github:trozzelle/sticky          # tracks main
 ```
 
-Pin a tag or commit with `github:trozzelle/sticky#<ref>`. Start a new `omp` session (or `/reload`) after installing.
+Start a new `omp` session (or `/reload`) after installing. `omp plugin upgrade omp-sticky` re-resolves the ref you installed: a `main` install picks up new commits, a tag install stays put. To move to a newer release, reinstall with its tag. Releases and their notes are listed on the [releases page](https://github.com/trozzelle/sticky/releases) and in [CHANGELOG.md](CHANGELOG.md).
 
 Tested against omp 18.6.3.
 
@@ -50,6 +51,19 @@ omp plugin link .      # load this checkout into omp; restart omp to pick up edi
 Don't also copy `sticky.ts` into `~/.omp/agent/extensions/` while linked: omp de-duplicates by path, so a copy and a link would both load.
 
 `@oh-my-pi/*` packages are dev dependencies only. At runtime omp resolves those imports to its own bundled copies, so keep their pinned versions in step with the omp release you test against.
+
+## Releasing
+
+Versions follow [SemVer](https://semver.org) and are cut by [release-please](https://github.com/googleapis/release-please) from [Conventional Commits](https://www.conventionalcommits.org) on `main`:
+
+| Commit | Effect (while < 1.0) |
+|---|---|
+| `fix: …` | patch bump |
+| `feat: …` | minor bump |
+| `feat!: …` / `BREAKING CHANGE:` footer | minor bump |
+| `chore:`, `docs:`, `test:`, `ci:`, … | no release |
+
+release-please keeps a release PR open that bumps `package.json` and `CHANGELOG.md`. Merging it tags `vX.Y.Z` and publishes a GitHub release.
 
 ## License
 
