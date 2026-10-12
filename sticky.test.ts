@@ -1,304 +1,254 @@
 /**
- * Throwaway mock-driven tests for the sticky extension.
- * Drives the extension factory with a mock ExtensionAPI and asserts behavior.
+ * Behavior tests for the sticky extension. The factory is driven with a fake
+ * ExtensionAPI; widget rows are rendered through the real @oh-my-pi/pi-tui
+ * width/wrap helpers, so layout assertions match what omp draws.
  */
 
-import { assertEquals } from "jsr:@std/assert";
-import { default as createSticky } from "./sticky.ts";
+import { describe, expect, test } from "bun:test";
+import { visibleWidth } from "@oh-my-pi/pi-tui";
+import createSticky from "./sticky.ts";
 
 type Handler = (event: unknown, ctx: unknown) => Promise<unknown>;
 
-interface MockCommand {
+interface FakeCommand {
 	description: string;
 	handler: (args: string, ctx: unknown) => Promise<void>;
 }
 
-interface CapturedMessage {
-	customType: string;
-	content: string;
-	display: boolean;
-}
-
-interface MockTheme {
-	fg: (color: string, text: string) => string;
-	bold: (text: string) => string;
-}
-
-type WidgetFactory = (tui: unknown, theme: MockTheme) => { render(width: number): readonly string[] };
-
-/** Identity theme: rows contain only visible text, so widths can be asserted directly. */
-const PLAIN_THEME: MockTheme = { fg: (_color, text) => text, bold: text => text };
-
-interface MockShortcut {
+interface FakeShortcut {
 	description?: string;
 	handler: (ctx: unknown) => Promise<void> | void;
 }
 
-/** Build a mock ExtensionAPI capturing registrations. */
-function makeMockPi() {
-	// Command/event/shortcut registries are runtime-populated, so Map is the right structure here.
-	const commands = new Map<string, MockCommand>();
+interface FakeTheme {
+	fg: (color: string, text: string) => string;
+	bold: (text: string) => string;
+}
+
+type WidgetFactory = (tui: unknown, theme: FakeTheme) => { render(width: number): readonly string[] };
+
+interface InjectedMessage {
+	message: { customType: string; content: string; display: boolean };
+}
+
+/** Identity theme: rows contain only visible text, so widths can be asserted directly. */
+const PLAIN_THEME: FakeTheme = { fg: (_color, text) => text, bold: text => text };
+
+/** Instantiate the extension against a fake ExtensionAPI and expose what it registered. */
+function setup() {
+	// Registries are filled at runtime by the extension, so Map fits here.
+	const commands = new Map<string, FakeCommand>();
 	const handlers = new Map<string, Handler[]>();
-	const shortcuts = new Map<string, MockShortcut>();
-	const notifications: Array<{ message: string; type: string }> = [];
+	const shortcuts = new Map<string, FakeShortcut>();
 	const widgetCalls: Array<{ key: string; content: WidgetFactory | undefined }> = [];
 
-	const ui = {
-		notify: (message: string, type: string = "info") => {
-			notifications.push({ message, type });
-		},
-		setWidget: (key: string, content: WidgetFactory | undefined) => {
-			widgetCalls.push({ key, content });
-		},
-	};
-
-	const pi = {
-		registerCommand: (name: string, options: MockCommand) => {
-			commands.set(name, options);
-		},
-		registerShortcut: (key: string, options: MockShortcut) => {
-			shortcuts.set(key, options);
-		},
-		on: (event: string, handler: Handler) => {
-			const list = handlers.get(event) ?? [];
-			list.push(handler);
-			handlers.set(event, list);
+	const ctx = {
+		hasUI: true,
+		mode: "tui",
+		ui: {
+			notify: () => {},
+			setWidget: (key: string, content: WidgetFactory | undefined) => {
+				widgetCalls.push({ key, content });
+			},
 		},
 	};
 
-	const ctx = { ui, hasUI: true, mode: "tui" };
+	createSticky({
+		registerCommand: (name: string, options: FakeCommand) => commands.set(name, options),
+		registerShortcut: (key: string, options: FakeShortcut) => shortcuts.set(key, options),
+		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+	} as never);
 
-	return { pi, commands, handlers, shortcuts, notifications, widgetCalls, ctx };
+	function lookup<T>(registry: Map<string, T>, key: string): T {
+		const entry = registry.get(key);
+		if (entry === undefined) throw new Error(`not registered: ${key}`);
+		return entry;
+	}
+
+	return {
+		ctx,
+		widgetCalls,
+		run: (name: string, args = "", runCtx: unknown = ctx) => lookup(commands, name).handler(args, runCtx),
+		toggle: (runCtx: unknown = ctx) => lookup(shortcuts, "alt+s").handler(runCtx),
+		emit: (event: string, payload: unknown = { type: event }) => {
+			const [handler] = lookup(handlers, event);
+			if (handler === undefined) throw new Error(`no handler for ${event}`);
+			return handler(payload, ctx);
+		},
+		/** Render the most recent widget at `width` columns. */
+		render: (width: number, theme: FakeTheme = PLAIN_THEME): readonly string[] => {
+			const last = widgetCalls.at(-1);
+			if (last?.content === undefined) throw new Error("no widget is set");
+			return last.content(undefined, theme).render(width);
+		},
+	};
 }
 
-/** Render the most recent widget at `width` columns. */
-function renderLastWidget(
-	widgetCalls: Array<{ content: WidgetFactory | undefined }>,
-	width: number,
-	theme: MockTheme = PLAIN_THEME,
-): readonly string[] {
-	const factory = widgetCalls[widgetCalls.length - 1].content;
-	if (factory === undefined) throw new Error("last widget call removed the widget");
-	return factory(undefined, theme).render(width);
-}
+describe("context injection", () => {
+	test("nothing is injected when nothing is pinned", async () => {
+		const s = setup();
+		expect(await s.emit("before_agent_start")).toBeUndefined();
+	});
 
-Deno.test("sticky registers /sticky and /unsticky commands", () => {
-	const { pi, commands } = makeMockPi();
-	createSticky(pi as never);
-	assertEquals(commands.has("sticky"), true);
-	assertEquals(commands.has("unsticky"), true);
+	test("/sticky pins text that is injected as a displayed custom message", async () => {
+		const s = setup();
+		await s.run("sticky", "Compare the two pipelines");
+		const result = (await s.emit("before_agent_start")) as InjectedMessage;
+		expect(result.message.customType).toBe("sticky-context");
+		expect(result.message.display).toBe(true);
+		expect(result.message.content).toContain("Compare the two pipelines");
+	});
+
+	test("the pin is injected on every turn, not just the first", async () => {
+		const s = setup();
+		await s.run("sticky", "long-lived context");
+		for (let turn = 0; turn < 3; turn++) {
+			const result = (await s.emit("before_agent_start")) as InjectedMessage;
+			expect(result.message.content).toContain("long-lived context");
+		}
+	});
+
+	test("bare /sticky does not set a pin", async () => {
+		const s = setup();
+		await s.run("sticky", "   ");
+		expect(await s.emit("before_agent_start")).toBeUndefined();
+	});
+
+	test("/unsticky stops injection", async () => {
+		const s = setup();
+		await s.run("sticky", "temp context");
+		await s.run("unsticky");
+		expect(await s.emit("before_agent_start")).toBeUndefined();
+	});
 });
 
-Deno.test("before_agent_start handler is registered", () => {
-	const { pi, handlers } = makeMockPi();
-	createSticky(pi as never);
-	assertEquals((handlers.get("before_agent_start") ?? []).length, 1);
+describe("collapsed widget", () => {
+	test("a short single-line pin is one row with no hint", async () => {
+		const s = setup();
+		await s.run("sticky", "comparing two pipelines");
+		expect(s.widgetCalls[0]?.key).toBe("sticky-context-widget");
+		expect(s.render(80)).toEqual([" Sticky: comparing two pipelines"]);
+	});
+
+	test("a multi-line pin shows the first line and the hidden-line count", async () => {
+		const s = setup();
+		await s.run("sticky", "first\nsecond\nthird");
+		expect(s.render(80)).toEqual([" Sticky: first (+2 · alt+s)"]);
+	});
+
+	test("label is bold in the custom-message label color; hint is dim", async () => {
+		const s = setup();
+		await s.run("sticky", "first\nsecond");
+		const tagging: FakeTheme = { fg: (color, text) => `<${color}>${text}</${color}>`, bold: text => `<b>${text}</b>` };
+		expect(s.render(80, tagging)).toEqual([
+			" <customMessageLabel><b>Sticky:</b></customMessageLabel> first<dim> (+1 · alt+s)</dim>",
+		]);
+	});
+
+	test("a long line fills exactly a quarter of a wide terminal", async () => {
+		const s = setup();
+		await s.run("sticky", "y".repeat(300));
+		const rows = s.render(200);
+		expect(rows).toHaveLength(1);
+		expect(visibleWidth(rows[0] ?? "")).toBe(1 + 50); // left pad + 200/4
+		expect(rows[0]).toEndWith("… (alt+s)");
+	});
+
+	test("the quarter is floored at 32 columns on narrow terminals", async () => {
+		const s = setup();
+		await s.run("sticky", "y".repeat(300));
+		expect(visibleWidth(s.render(80)[0] ?? "")).toBe(1 + 32); // 80/4 = 20 < 32
+	});
+
+	test("below the floor the hint is dropped rather than the text", async () => {
+		const s = setup();
+		await s.run("sticky", "abcdefghijklmnop\nmore");
+		expect(s.render(20)).toEqual([" Sticky: abcdefghi…"]); // inner width 18
+	});
+
+	test("double-width characters are measured by display width", async () => {
+		const s = setup();
+		await s.run("sticky", "漢字".repeat(100));
+		expect(visibleWidth(s.render(200)[0] ?? "")).toBeLessThanOrEqual(1 + 50);
+	});
 });
 
-Deno.test("no injection when nothing pinned", async () => {
-	const { pi, handlers } = makeMockPi();
-	createSticky(pi as never);
-	const handler = handlers.get("before_agent_start")![0];
-	const result = await handler({ type: "before_agent_start", prompt: "hi" }, {});
-	assertEquals(result, undefined);
+describe("expanded widget (alt+s)", () => {
+	test("shows every line under the label and collapses back", async () => {
+		const s = setup();
+		await s.run("sticky", "first\nsecond");
+		await s.toggle();
+		expect(s.render(80)).toEqual([" Sticky: first", "         second", "         alt+s to collapse"]);
+		await s.toggle();
+		expect(s.render(80)).toEqual([" Sticky: first (+1 · alt+s)"]);
+	});
+
+	test("wraps at word boundaries with a hanging indent", async () => {
+		const s = setup();
+		await s.run("sticky", "lorem ipsum dolor sit amet consectetur");
+		await s.toggle();
+		// width 30 → inner 28 → 20 text columns after the 8-column label
+		expect(s.render(30)).toEqual([" Sticky: lorem ipsum dolor", "         sit amet consectetur", "         alt+s to collapse"]);
+	});
+
+	test("stays within a quarter of a wide terminal", async () => {
+		const s = setup();
+		await s.run("sticky", "z".repeat(100));
+		await s.toggle();
+		// width 200 → budget 50 → 42 text columns after the label
+		const rows = s.render(200);
+		expect(rows).toEqual([
+			` Sticky: ${"z".repeat(42)}`,
+			`         ${"z".repeat(42)}`,
+			`         ${"z".repeat(16)}`,
+			"         alt+s to collapse",
+		]);
+		expect(Math.max(...rows.map(visibleWidth))).toBe(1 + 50);
+	});
+
+	test("expanded state survives replacing the pin", async () => {
+		const s = setup();
+		await s.run("sticky", "old");
+		await s.toggle();
+		await s.run("sticky", "new\nlines");
+		expect(s.render(80)).toHaveLength(3);
+	});
+
+	test("alt+s with nothing pinned leaves the widget alone", async () => {
+		const s = setup();
+		await s.toggle();
+		expect(s.widgetCalls).toHaveLength(0);
+	});
 });
 
-Deno.test("/sticky sets state and next before_agent_start injects it", async () => {
-	const { pi, commands, handlers, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("Compare the two pipelines", ctx);
-	const handler = handlers.get("before_agent_start")![0];
-	const result = (await handler({ type: "before_agent_start", prompt: "hi" }, {})) as {
-		message: CapturedMessage;
-	};
-	assertEquals(result.message.customType, "sticky-context");
-	assertEquals(result.message.display, true);
-	assertEquals(result.message.content.includes("Compare the two pipelines"), true);
-	assertEquals(result.message.content.includes("pinned context"), true);
-});
+describe("widget lifecycle", () => {
+	test("/unsticky removes the widget", async () => {
+		const s = setup();
+		await s.run("sticky", "temp");
+		await s.run("unsticky");
+		expect(s.widgetCalls.at(-1)).toEqual({ key: "sticky-context-widget", content: undefined });
+	});
 
-Deno.test("/sticky with no args does not inject", async () => {
-	const { pi, commands, handlers, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("", ctx);
-	const handler = handlers.get("before_agent_start")![0];
-	const result = await handler({ type: "before_agent_start", prompt: "hi" }, {});
-	assertEquals(result, undefined);
-});
+	test("session_start re-renders the pin for the new session", async () => {
+		const s = setup();
+		await s.run("sticky", "carried context");
+		const before = s.widgetCalls.length;
+		await s.emit("session_start", { type: "session_start", reason: "new" });
+		expect(s.widgetCalls).toHaveLength(before + 1);
+		expect(s.render(80)).toEqual([" Sticky: carried context"]);
+	});
 
-Deno.test("/unsticky clears state and stops injection", async () => {
-	const { pi, commands, handlers, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("temp context", ctx);
-	await commands.get("unsticky")!.handler("", ctx);
-	const handler = handlers.get("before_agent_start")![0];
-	const result = await handler({ type: "before_agent_start", prompt: "hi" }, {});
-	assertEquals(result, undefined);
-});
+	test("non-TUI modes never touch the widget", async () => {
+		const s = setup();
+		const rpcCtx = { ...s.ctx, mode: "rpc" };
+		await s.run("sticky", "text", rpcCtx);
+		await s.toggle(rpcCtx);
+		expect(s.widgetCalls).toHaveLength(0);
+	});
 
-Deno.test("/unsticky with nothing pinned does not throw", async () => {
-	const { pi, commands, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("unsticky")!.handler("", ctx);
-});
-
-Deno.test("state persists across multiple before_agent_start invocations (harness lifetime)", async () => {
-	const { pi, commands, handlers, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("long-lived context", ctx);
-	const handler = handlers.get("before_agent_start")![0];
-	const first = (await handler({ type: "before_agent_start", prompt: "a" }, {})) as { message: { content: string } };
-	const second = (await handler({ type: "before_agent_start", prompt: "b" }, {})) as { message: { content: string } };
-	assertEquals(first.message.content.includes("long-lived context"), true);
-	assertEquals(second.message.content.includes("long-lived context"), true);
-});
-
-Deno.test("collapsed widget: short single-line pin renders as one row, no hint", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("comparing two pipelines", ctx);
-	assertEquals(widgetCalls[0].key, "sticky-context-widget");
-	assertEquals(renderLastWidget(widgetCalls, 80), [" Sticky: comparing two pipelines"]);
-});
-
-Deno.test("collapsed widget: multi-line pin shows first line plus hidden-line count", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("first\nsecond\nthird", ctx);
-	assertEquals(renderLastWidget(widgetCalls, 80), [" Sticky: first (+2 · alt+s)"]);
-});
-
-Deno.test("collapsed widget: label is bold in the custom-message label color, hint is dim", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("first\nsecond", ctx);
-	const tagging: MockTheme = { fg: (color, text) => `<${color}>${text}</${color}>`, bold: text => `<b>${text}</b>` };
-	assertEquals(renderLastWidget(widgetCalls, 80, tagging), [
-		" <customMessageLabel><b>Sticky:</b></customMessageLabel> first<dim> (+1 · alt+s)</dim>",
-	]);
-});
-
-Deno.test("collapsed widget: long line fills exactly a quarter of a wide terminal", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("y".repeat(300), ctx);
-	const rows = renderLastWidget(widgetCalls, 200);
-	assertEquals(rows.length, 1);
-	assertEquals(rows[0].length, 1 + 50); // left pad + 200/4
-	assertEquals(rows[0].endsWith("… (alt+s)"), true);
-});
-
-Deno.test("collapsed widget: quarter width is floored so narrow terminals still show text", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("y".repeat(300), ctx);
-	assertEquals(renderLastWidget(widgetCalls, 80)[0].length, 1 + 32); // 80/4 = 20 < floor 32
-});
-
-Deno.test("collapsed widget: narrower than the floor drops the hint rather than the text", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("abcdefghijklmnop\nmore", ctx);
-	assertEquals(renderLastWidget(widgetCalls, 20), [" Sticky: abcdefghi…"]); // inner 18
-});
-
-Deno.test("alt+s expands to every line aligned under the prefix, and collapses back", async () => {
-	const { pi, commands, shortcuts, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("first\nsecond", ctx);
-	const toggle = shortcuts.get("alt+s");
-	if (toggle === undefined) throw new Error("alt+s shortcut not registered");
-
-	await toggle.handler(ctx);
-	assertEquals(renderLastWidget(widgetCalls, 80), [
-		" Sticky: first",
-		"         second",
-		"         alt+s to collapse",
-	]);
-
-	await toggle.handler(ctx);
-	assertEquals(renderLastWidget(widgetCalls, 80), [" Sticky: first (+1 · alt+s)"]);
-});
-
-Deno.test("expanded widget wraps long lines with a hanging indent", async () => {
-	const { pi, commands, shortcuts, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("z".repeat(30), ctx);
-	await shortcuts.get("alt+s")!.handler(ctx);
-	// width 30 → inner 28 → text column 20 after the 8-col prefix
-	assertEquals(renderLastWidget(widgetCalls, 30), [
-		` Sticky: ${"z".repeat(20)}`,
-		`         ${"z".repeat(10)}`,
-		"         alt+s to collapse",
-	]);
-});
-
-Deno.test("expanded widget wraps within a quarter of a wide terminal", async () => {
-	const { pi, commands, shortcuts, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("z".repeat(100), ctx);
-	await shortcuts.get("alt+s")!.handler(ctx);
-	// width 200 → budget 50 → text column 42 after the 8-col label
-	const rows = renderLastWidget(widgetCalls, 200);
-	assertEquals(rows, [
-		` Sticky: ${"z".repeat(42)}`,
-		`         ${"z".repeat(42)}`,
-		`         ${"z".repeat(16)}`,
-		"         alt+s to collapse",
-	]);
-	assertEquals(Math.max(...rows.map(row => row.length)), 1 + 50);
-});
-
-Deno.test("expanded state persists when the pin is replaced", async () => {
-	const { pi, commands, shortcuts, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("old", ctx);
-	await shortcuts.get("alt+s")!.handler(ctx);
-	await commands.get("sticky")!.handler("new\nlines", ctx);
-	assertEquals(renderLastWidget(widgetCalls, 80).length, 3);
-});
-
-Deno.test("alt+s does nothing when nothing is pinned", async () => {
-	const { pi, shortcuts, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await shortcuts.get("alt+s")!.handler(ctx);
-	assertEquals(widgetCalls.length, 0);
-});
-
-Deno.test("/unsticky removes the widget", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("temp", ctx);
-	await commands.get("unsticky")!.handler("", ctx);
-	assertEquals(widgetCalls.length, 2);
-	assertEquals(widgetCalls[1].key, "sticky-context-widget");
-	assertEquals(widgetCalls[1].content, undefined);
-});
-
-Deno.test("widget is not touched in non-TUI context", async () => {
-	const { pi, commands, shortcuts, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	const rpcCtx = { ...ctx, mode: "rpc" };
-	await commands.get("sticky")!.handler("text", rpcCtx);
-	await shortcuts.get("alt+s")!.handler(rpcCtx);
-	assertEquals(widgetCalls.length, 0);
-});
-
-Deno.test("widget is not touched when hasUI is false", async () => {
-	const { pi, commands, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("text", { ...ctx, hasUI: false });
-	assertEquals(widgetCalls.length, 0);
-});
-
-Deno.test("session_start re-renders the widget for the new session", async () => {
-	const { pi, commands, handlers, widgetCalls, ctx } = makeMockPi();
-	createSticky(pi as never);
-	await commands.get("sticky")!.handler("carried context", ctx);
-	const startHandlers = handlers.get("session_start") ?? [];
-	assertEquals(startHandlers.length, 1);
-	const before = widgetCalls.length;
-	await startHandlers[0]({ type: "session_start", reason: "new" }, ctx);
-	assertEquals(widgetCalls.length, before + 1);
-	assertEquals(renderLastWidget(widgetCalls, 80), [" Sticky: carried context"]);
+	test("a TUI context without UI never touches the widget", async () => {
+		const s = setup();
+		await s.run("sticky", "text", { ...s.ctx, hasUI: false });
+		expect(s.widgetCalls).toHaveLength(0);
+	});
 });

@@ -75,7 +75,7 @@ function renderStickyRows(text: string, expanded: boolean, width: number, style:
 		return rows.map(row => ` ${row}`);
 	}
 
-	const first = lines[0];
+	const first = lines[0] ?? "";
 	const hidden = lines.length - 1;
 	if (hidden === 0 && LABEL_WIDTH + visibleWidth(first) <= budget) return [` ${style.label} ${first}`];
 

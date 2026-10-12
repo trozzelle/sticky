@@ -1,6 +1,0 @@
-{
-  "imports": {
-    "@oh-my-pi/pi-coding-agent": "npm:@oh-my-pi/pi-coding-agent@^18.9.2",
-    "@oh-my-pi/pi-tui": "npm:@oh-my-pi/pi-tui@^18.9.2"
-  }
-}
